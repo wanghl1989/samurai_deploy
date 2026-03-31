@@ -1,0 +1,11 @@
+checkpoints/*
+.claude
+.cache
+
+__pycache__
+
+build
+
+onnx_model
+*.engine
+*.onnx

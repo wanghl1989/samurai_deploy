@@ -1,0 +1,21 @@
+CompileFlags:
+  Add:
+    - "-std=c++17"
+    - "-Wall"
+    - "-Wextra"
+    # Eigen headers
+    - "-I/usr/include/eigen3"
+    # TensorRT headers
+    - "-I/usr/include/x86_64-linux-gnu"
+    - "-I/usr/local/cuda/include"
+    # spdlog headers
+    - "-I/usr/include/spdlog"
+  Remove:
+    - "-W*"
+
+Diagnostics:
+  UnusedIncludes: Strict
+  MissingIncludes: Strict
+
+Index:
+  Background: Build

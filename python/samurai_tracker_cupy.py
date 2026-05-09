@@ -1,51 +1,353 @@
-import argparse
 import os
 import time
 
+import cuda.bindings.runtime as cudart
 import cv2
 import numpy as np
 import onnx
-import pycuda.driver as cuda
+import scipy.linalg
 import tensorrt as trt
-from kalman_filter import KalmanFilter
-from tqdm import tqdm
 
-colors = [
-    (0, 0, 255),  # red 0
-    (0, 255, 0),  # green 1
-    (255, 0, 0),  # blue 2
-    (255, 255, 0),  # cyan 3
-    (255, 0, 255),  # magenta 4
-    (0, 255, 255),  # yellow 5
-    (255, 255, 255),  # white 6
-    (128, 128, 128),  # gray 7
-    (140, 140, 0),  # mars green 8
-    (167, 47, 0),  # klein blue 9
-    (39, 88, 232),  # hermes orange 10
-    (32, 0, 128),  # burgundy 11
-    (208, 216, 129),  # tiffany blue 12
-    (9, 0, 76),  # bordeaux 13
-    (36, 220, 249),  # sennelier yellow 14
-]
+"""
+Table for the 0.95 quantile of the chi-square distribution with N degrees of
+freedom (contains values for N=1, ..., 9). Taken from MATLAB/Octave's chi2inv
+function and used as Mahalanobis gating threshold.
+"""
+chi2inv95 = {
+    1: 3.8415,
+    2: 5.9915,
+    3: 7.8147,
+    4: 9.4877,
+    5: 11.070,
+    6: 12.592,
+    7: 14.067,
+    8: 15.507,
+    9: 16.919,
+}
 
 
-def timer_decorator(func):
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        result = func(*args, **kwargs)
-        end_time = time.time()
-        print(f"{func.__name__} 执行时间: {(end_time - start_time) * 1000:.4f}ms")
-        return result
+class KalmanFilter:
+    """
+    A simple Kalman filter for tracking bounding boxes in image space.
 
-    return wrapper
+    The 8-dimensional state space
+
+        x, y, a, h, vx, vy, va, vh
+
+    contains the bounding box center position (x, y), aspect ratio a, height h,
+    and their respective velocities.
+
+    Object motion follows a constant velocity model. The bounding box location
+    (x, y, a, h) is taken as direct observation of the state space (linear
+    observation model).
+
+    """
+
+    def __init__(self):
+        ndim, dt = 4, 1.0
+
+        # Create Kalman filter model matrices.
+        self._motion_mat = np.eye(2 * ndim, 2 * ndim)
+        for i in range(ndim):
+            self._motion_mat[i, ndim + i] = dt
+        self._update_mat = np.eye(ndim, 2 * ndim)
+
+        # Motion and observation uncertainty are chosen relative to the current
+        # state estimate. These weights control the amount of uncertainty in
+        # the model. This is a bit hacky.
+        self._std_weight_position = 1.0 / 20
+        self._std_weight_velocity = 1.0 / 160
+
+    def initiate(self, measurement):
+        """Create track from unassociated measurement.
+
+        Parameters
+        ----------
+        measurement : ndarray
+            Bounding box coordinates (x, y, a, h) with center position (x, y),
+            aspect ratio a, and height h.
+
+        Returns
+        -------
+        (ndarray, ndarray)
+            Returns the mean vector (8 dimensional) and covariance matrix (8x8
+            dimensional) of the new track. Unobserved velocities are initialized
+            to 0 mean.
+
+        """
+        mean_pos = measurement
+        mean_vel = np.zeros_like(mean_pos)
+        mean = np.r_[mean_pos, mean_vel]
+
+        std = [
+            2 * self._std_weight_position * measurement[3],
+            2 * self._std_weight_position * measurement[3],
+            1e-2,
+            2 * self._std_weight_position * measurement[3],
+            10 * self._std_weight_velocity * measurement[3],
+            10 * self._std_weight_velocity * measurement[3],
+            1e-5,
+            10 * self._std_weight_velocity * measurement[3],
+        ]
+        covariance = np.diag(np.square(std))
+        return mean, covariance
+
+    def predict(self, mean, covariance):
+        """Run Kalman filter prediction step.
+
+        Parameters
+        ----------
+        mean : ndarray
+            The 8 dimensional mean vector of the object state at the previous
+            time step.
+        covariance : ndarray
+            The 8x8 dimensional covariance matrix of the object state at the
+            previous time step.
+
+        Returns
+        -------
+        (ndarray, ndarray)
+            Returns the mean vector and covariance matrix of the predicted
+            state. Unobserved velocities are initialized to 0 mean.
+
+        """
+        std_pos = [
+            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[3],
+            1e-2,
+            self._std_weight_position * mean[3],
+        ]
+        std_vel = [
+            self._std_weight_velocity * mean[3],
+            self._std_weight_velocity * mean[3],
+            1e-5,
+            self._std_weight_velocity * mean[3],
+        ]
+        motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
+
+        # mean = np.dot(self._motion_mat, mean)
+        mean = np.dot(mean, self._motion_mat.T)
+        covariance = (
+            np.linalg.multi_dot((self._motion_mat, covariance, self._motion_mat.T)) + motion_cov
+        )
+
+        return mean, covariance
+
+    def project(self, mean, covariance):
+        """Project state distribution to measurement space.
+
+        Parameters
+        ----------
+        mean : ndarray
+            The state's mean vector (8 dimensional array).
+        covariance : ndarray
+            The state's covariance matrix (8x8 dimensional).
+
+        Returns
+        -------
+        (ndarray, ndarray)
+            Returns the projected mean and covariance matrix of the given state
+            estimate.
+
+        """
+        std = [
+            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[3],
+            1e-1,
+            self._std_weight_position * mean[3],
+        ]
+        innovation_cov = np.diag(np.square(std))
+
+        mean = np.dot(self._update_mat, mean)
+        covariance = np.linalg.multi_dot((self._update_mat, covariance, self._update_mat.T))
+        return mean, covariance + innovation_cov
+
+    def multi_predict(self, mean, covariance):
+        """Run Kalman filter prediction step (Vectorized version).
+        Parameters
+        ----------
+        mean : ndarray
+            The Nx8 dimensional mean matrix of the object states at the previous
+            time step.
+        covariance : ndarray
+            The Nx8x8 dimensional covariance matrics of the object states at the
+            previous time step.
+        Returns
+        -------
+        (ndarray, ndarray)
+            Returns the mean vector and covariance matrix of the predicted
+            state. Unobserved velocities are initialized to 0 mean.
+        """
+        std_pos = [
+            self._std_weight_position * mean[:, 3],
+            self._std_weight_position * mean[:, 3],
+            1e-2 * np.ones_like(mean[:, 3]),
+            self._std_weight_position * mean[:, 3],
+        ]
+        std_vel = [
+            self._std_weight_velocity * mean[:, 3],
+            self._std_weight_velocity * mean[:, 3],
+            1e-5 * np.ones_like(mean[:, 3]),
+            self._std_weight_velocity * mean[:, 3],
+        ]
+        sqr = np.square(np.r_[std_pos, std_vel]).T
+
+        motion_cov = []
+        for i in range(len(mean)):
+            motion_cov.append(np.diag(sqr[i]))
+        motion_cov = np.asarray(motion_cov)
+
+        mean = np.dot(mean, self._motion_mat.T)
+        left = np.dot(self._motion_mat, covariance).transpose((1, 0, 2))
+        covariance = np.dot(left, self._motion_mat.T) + motion_cov
+
+        return mean, covariance
+
+    def update(self, mean, covariance, measurement):
+        """Run Kalman filter correction step.
+
+        Parameters
+        ----------
+        mean : ndarray
+            The predicted state's mean vector (8 dimensional).
+        covariance : ndarray
+            The state's covariance matrix (8x8 dimensional).
+        measurement : ndarray
+            The 4 dimensional measurement vector (x, y, a, h), where (x, y)
+            is the center position, a the aspect ratio, and h the height of the
+            bounding box.
+
+        Returns
+        -------
+        (ndarray, ndarray)
+            Returns the measurement-corrected state distribution.
+
+        """
+        projected_mean, projected_cov = self.project(mean, covariance)
+
+        chol_factor, lower = scipy.linalg.cho_factor(projected_cov, lower=True, check_finite=False)
+        kalman_gain = scipy.linalg.cho_solve(
+            (chol_factor, lower), np.dot(covariance, self._update_mat.T).T, check_finite=False
+        ).T
+        innovation = measurement - projected_mean
+
+        new_mean = mean + np.dot(innovation, kalman_gain.T)
+        new_covariance = covariance - np.linalg.multi_dot(
+            (kalman_gain, projected_cov, kalman_gain.T)
+        )
+        return new_mean, new_covariance
+
+    def gating_distance(self, mean, covariance, measurements, only_position=False, metric="maha"):
+        """Compute gating distance between state distribution and measurements.
+        A suitable distance threshold can be obtained from `chi2inv95`. If
+        `only_position` is False, the chi-square distribution has 4 degrees of
+        freedom, otherwise 2.
+        Parameters
+        ----------
+        mean : ndarray
+            Mean vector over the state distribution (8 dimensional).
+        covariance : ndarray
+            Covariance of the state distribution (8x8 dimensional).
+        measurements : ndarray
+            An Nx4 dimensional matrix of N measurements, each in
+            format (x, y, a, h) where (x, y) is the bounding box center
+            position, a the aspect ratio, and h the height.
+        only_position : Optional[bool]
+            If True, distance computation is done with respect to the bounding
+            box center position only.
+        Returns
+        -------
+        ndarray
+            Returns an array of length N, where the i-th element contains the
+            squared Mahalanobis distance between (mean, covariance) and
+            `measurements[i]`.
+        """
+        mean, covariance = self.project(mean, covariance)
+        if only_position:
+            mean, covariance = mean[:2], covariance[:2, :2]
+            measurements = measurements[:, :2]
+
+        d = measurements - mean
+        if metric == "gaussian":
+            return np.sum(d * d, axis=1)
+        elif metric == "maha":
+            cholesky_factor = np.linalg.cholesky(covariance)
+            z = scipy.linalg.solve_triangular(
+                cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True
+            )
+            squared_maha = np.sum(z * z, axis=0)
+            return squared_maha
+        else:
+            raise ValueError("invalid distance metric")
+
+    def compute_iou(self, pred_bbox, bboxes):
+        """
+        Compute the IoU between the bbox and the bboxes
+        """
+        ious = []
+        pred_bbox = self.xyah_to_xyxy(pred_bbox)
+        for bbox in bboxes:
+            iou = self._compute_iou(pred_bbox, bbox)
+            ious.append(iou)
+        return ious
+
+    def _compute_iou(self, bbox1, bbox2):
+        """
+        Compute the Intersection over Union (IoU) of two bounding boxes.
+        Parameters
+        ----------
+        bbox1 : list
+            The first bounding box in the format [x1, y1, x2, y2].
+        bbox2 : list
+            The second bounding box in the format [x1, y1, x2, y2].
+        Returns
+        -------
+        float
+            The IoU of the two bounding boxes.
+        """
+        if bbox2 == [0, 0, 0, 0]:
+            return 0
+        x1, y1, x2, y2 = bbox1
+        x1_, y1_, x2_, y2_ = bbox2
+        # Calculate intersection area
+        intersection_area = max(0, min(x2, x2_) - max(x1, x1_)) * max(
+            0, min(y2, y2_) - max(y1, y1_)
+        )
+        # Calculate union area
+        union_area = (x2 - x1) * (y2 - y1) + (x2_ - x1_) * (y2_ - y1_) - intersection_area
+        # Calculate IoU
+        iou = intersection_area / union_area if union_area != 0 else 0
+        return iou
+
+    def xyxy_to_xyah(self, bbox):
+        x1, y1, x2, y2 = bbox
+        xc = (x1 + x2) / 2
+        yc = (y1 + y2) / 2
+        w = x2 - x1
+        h = y2 - y1
+        if h == 0:
+            h = 1
+        return [xc, yc, w / h, h]
+
+    def xyah_to_xyxy(self, bbox):
+        xc, yc, a, h = bbox
+        x1 = xc - a * h / 2
+        y1 = yc - h / 2
+        x2 = xc + a * h / 2
+        y2 = yc + h / 2
+        return [x1, y1, x2, y2]
 
 
 class SAM2TrackerTRT:
-    def __init__(self, args):
-        self.args = args
-        self.onnx_file_prefix = args.onnx_model_path
-        self.trt_engine_prefix = args.trt_engine_path
-        self.fp16_mode = args.use_fp16
+    def __init__(
+        self,
+        onnx_model_path: str,
+        trt_engine_path: str | None = None,
+        use_fp16: bool = False,
+    ):
+        self.onnx_file_prefix = onnx_model_path
+        self.trt_engine_prefix = trt_engine_path
+        self.fp16_mode = use_fp16
 
         # Create a TensorRT logger
         self.trt_logger = trt.Logger(trt.Logger.WARNING)
@@ -55,6 +357,7 @@ class SAM2TrackerTRT:
 
         self.buffers = []
         self.contexts = []
+
         for engine in self.engines:
             profile_idx = range(engine.num_optimization_profiles)[0]
             inputs, outputs, bindings, stream = self.allocate_buffers(
@@ -67,14 +370,6 @@ class SAM2TrackerTRT:
         self.image_size = 512
         self.video_W, self.video_H = 0, 0
 
-        self.maskmem_tpos_enc = None
-
-        self.memory_bank = {}
-        self.kf = KalmanFilter()
-        self.kf_mean = None
-        self.kf_covariance = None
-        self.stable_frames = 0
-
         self.stable_frames_threshold = 15
         self.stable_ious_threshold = 0.3
         self.kf_score_weight = 0.25
@@ -83,6 +378,20 @@ class SAM2TrackerTRT:
         self.memory_bank_kf_score_threshold = 0.0
         self.max_obj_ptrs_in_encoder = 16
         self.num_maskmem = 7
+
+        self.init_state()
+
+    def reset(self):
+        self.init_state()
+
+    def init_state(self):
+        self.memory_bank = {}
+        self.kf = KalmanFilter()
+        self.kf_mean = None
+        self.kf_covariance = None
+        self.stable_frames = 0
+        self.maskmem_tpos_enc = None
+        self.frame_idx = 0
 
     def init_video(self, video_width, video_height):
         self.video_H = video_height
@@ -119,10 +428,20 @@ class SAM2TrackerTRT:
             for i, model in enumerate(onnx_models):
                 onnx_model_path = os.path.join(self.onnx_file_prefix, model)
                 engine_path = os.path.join(self.onnx_file_prefix, trt_engines[i])
+
                 if os.path.exists(engine_path):
-                    print("The {} fonud, skip building!".format(engine_path))
-                    engines.append(self.load_engine(engine_path))
-                    continue
+                    print("Found existing engine {}, trying to load...".format(engine_path))
+                    loaded_engine = self.load_engine(engine_path)
+                    if loaded_engine is not None:
+                        engines.append(loaded_engine)
+                        print("Successfully loaded {}!".format(engine_path))
+                        continue
+                    else:
+                        print(
+                            "Failed to load {} (possibly version mismatch), rebuilding...".format(
+                                engine_path
+                            )
+                        )
 
                 # check onnx model
                 onnx_model = onnx.load(onnx_model_path)
@@ -136,6 +455,17 @@ class SAM2TrackerTRT:
                 engines.append(self.load_engine(engine_path))
         else:
             print("Please specify the path to the TRT engine or ONNX model!")
+
+        # Validate all engines were loaded successfully
+        if len(engines) != len(onnx_models):
+            raise RuntimeError(
+                "Failed to load all required engines. Got {}/{}".format(
+                    len(engines), len(onnx_models)
+                )
+            )
+        for i, engine in enumerate(engines):
+            if engine is None:
+                raise RuntimeError("Engine {} failed to load properly".format(onnx_models[i]))
 
         return engines
 
@@ -162,8 +492,6 @@ class SAM2TrackerTRT:
                 trt.MemoryPoolType.WORKSPACE, 1 << 30
             )  # Set workspace size to 1GB
 
-            # Optionally, set other configurations like precision
-            # For example, to use FP16 precision:
             if builder.platform_has_fast_fp16 and fp16_mode:
                 # config.set_flag(trt.BuilderFlag.FP16)
                 config.set_flag(trt.BuilderFlag.BF16)
@@ -223,8 +551,12 @@ class SAM2TrackerTRT:
             f.write(engine)
 
     def load_engine(self, engine_file_path):
-        with open(engine_file_path, "rb") as f, trt.Runtime(self.trt_logger) as runtime:
-            return runtime.deserialize_cuda_engine(f.read())
+        try:
+            with open(engine_file_path, "rb") as f, trt.Runtime(self.trt_logger) as runtime:
+                return runtime.deserialize_cuda_engine(f.read())
+        except Exception as e:
+            print("Error loading engine {}: {}".format(engine_file_path, str(e)))
+            return None
 
     def allocate_buffers(self, engine, context=None, profile_idx=None):
         """
@@ -233,7 +565,7 @@ class SAM2TrackerTRT:
         inputs_buffer = []
         outputs_buffer = []
         bindings = []
-        stream = cuda.Stream()
+        stream = cudart.cudaStreamCreate()[1]
 
         for i in range(engine.num_io_tensors):
             tensor_name = engine.get_tensor_name(i)
@@ -255,12 +587,10 @@ class SAM2TrackerTRT:
             dtype = trt.nptype(engine.get_tensor_dtype(tensor_name))
 
             # Allocate host and device buffers
-            host_mem = cuda.pagelocked_empty(
-                size, dtype
-            )  # page-locked memory buffer (won't swapped to disk)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            host_mem = np.empty(size, dtype=dtype)
+            device_mem = cudart.cudaMalloc(host_mem.nbytes)[1]
 
-            # Append the device buffer address to device bindings. When cast to int, it's a linear index into the context's memory (like memory address). See https://documen.tician.de/pycuda/driver.html#pycuda.driver.DeviceAllocation
+            # Append the device buffer address to device bindings.
             bindings.append(int(device_mem))
 
             # Append to the appropriate input/output list.
@@ -293,50 +623,46 @@ class SAM2TrackerTRT:
 
         inputs_buffer, outputs_buffer, bindings, stream = buffers
 
-        for i, input in enumerate(inputs_buffer):
-            # print("Input {}: {}, {}, {}".format(i, inputs_buffer[i]['name'], input_datas[i].shape, inputs_buffer[i]['shape']))
+        for i, _input in enumerate(inputs_buffer):
             np.copyto(inputs_buffer[i]["host_mem"], input_datas[i].ravel())
 
-        # 数据传输与执行
-        [
-            cuda.memcpy_htod_async(
-                inputs_buffer[i]["device_mem"], inputs_buffer[i]["host_mem"], stream
+        for i in range(len(inputs_buffer)):
+            cudart.cudaMemcpyAsync(
+                inputs_buffer[i]["device_mem"],
+                inputs_buffer[i]["host_mem"].ctypes.data,
+                inputs_buffer[i]["host_mem"].nbytes,
+                cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                stream,
             )
-            for i in range(len(inputs_buffer))
-        ]
 
         for i in range(engine.num_io_tensors):
             context.set_tensor_address(engine.get_tensor_name(i), bindings[i])
 
-        context.execute_async_v3(stream_handle=stream.handle)
+        context.execute_async_v3(stream_handle=stream)
 
-        [
-            cuda.memcpy_dtoh_async(
-                outputs_buffer[i]["host_mem"], outputs_buffer[i]["device_mem"], stream
+        for i in range(len(outputs_buffer)):
+            cudart.cudaMemcpyAsync(
+                outputs_buffer[i]["host_mem"].ctypes.data,
+                outputs_buffer[i]["device_mem"],
+                outputs_buffer[i]["host_mem"].nbytes,
+                cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                stream,
             )
-            for i in range(len(outputs_buffer))
-        ]
 
-        stream.synchronize()
+        cudart.cudaStreamSynchronize(stream)
         execute_end = time.time()
 
-        # print("execute_async_v3 time: {:.3} ms".format((execute_end - execute_begin) * 1000))
+        print("execute_async_v3 time: {:.3} ms".format((execute_end - execute_begin) * 1000))
 
         retrieve_begin = time.time()
         outputs_data = [
             output["host_mem"].reshape(output["shape"]).copy() for output in outputs_buffer
         ]
         retrieve_end = time.time()
-        # print("Retrieve time: {:.3} ms".format((retrieve_end - retrieve_begin) * 1000))
-
-        # [cuda.memcpy_htod(inputs_buffer[i]['device_mem'], inputs_buffer[i]['host_mem']) for i in range(len(inputs_buffer))]
-        # context.execute_v2(bindings=bindings)
-        # [cuda.memcpy_dtoh(output['host_mem'], output['device_mem']) for output in outputs_buffer]
-        # outputs_data = [output['host_mem'].reshape(output['shape']) for output in outputs_buffer]
+        print("Retrieve time: {:.3} ms".format((retrieve_end - retrieve_begin) * 1000))
 
         return outputs_data
 
-     
     def image_encoder_inference(self, input_image):
         """
         Image encoder inference.
@@ -350,8 +676,7 @@ class SAM2TrackerTRT:
             self.buffers[0],
         )
 
-     
-    def memory_attention_inference_test(self, frame_idx, vision_feats, vision_pos, i):
+    def memory_attention_inference_test(self, _frame_idx, vision_feats, vision_pos, i):
         """
         Memory attention inference for testing.
         """
@@ -362,8 +687,6 @@ class SAM2TrackerTRT:
         object_ptrs = np.ones((m, 1, 256)).astype(np.float32)
         obj_pos_enc = np.ones((m,)).astype(np.int32)
 
-        inputs_buffer, outputs_buffer, bindings, stream = self.buffers[1]
-        # self.contexts[1].set_optimization_profile_async(0, stream=stream.handle)
         self.contexts[1].set_input_shape("maskmem_feats", (1024, n, 1, 64))
         self.contexts[1].set_input_shape("memory_pos_embed", (1024, n, 1, 64))
         self.contexts[1].set_input_shape("obj_ptrs", (m, 1, 256))
@@ -378,7 +701,6 @@ class SAM2TrackerTRT:
         )
         return memory_attention_outputs
 
-     
     def memory_attention_inference(self, frame_idx, vision_feats, vision_pos):
         """
         Memory attention inference.
@@ -386,7 +708,6 @@ class SAM2TrackerTRT:
         memmask_features = [self.memory_bank[0]["maskmem_features"].copy()]
         memmask_pos_enc = [self.memory_bank[0]["maskmem_pos_enc"] + self.maskmem_tpos_enc[6]]
         object_ptrs = [self.memory_bank[0]["obj_ptr"].copy()]
-        ## samurai----------------------------------------------- ##
         valid_indices = []
         if frame_idx > 1:
             for i in range(frame_idx - 1, 0, -1):  # Iterate backwards through previous frames
@@ -405,8 +726,6 @@ class SAM2TrackerTRT:
                     valid_indices.insert(0, i)
                 # valid_indices.insert(0, i)
 
-        # print("valid_indices: ", valid_indices, '\nprev_frame_idx : ', end='')
-        # 最近6帧的memmask_features
         for prev_frame_idx in valid_indices[::-1]:
             # print(prev_frame_idx, end=', ')
             mem = self.memory_bank.get(prev_frame_idx, None)
@@ -415,15 +734,11 @@ class SAM2TrackerTRT:
                 memmask_pos_enc.insert(1, mem["maskmem_pos_enc"].copy())
             if len(memmask_features) >= self.num_maskmem:
                 break
-        # print()
-        ## samurai----------------------------------------------- ##
 
         obj_pos_enc = np.arange(1, frame_idx)[:15]
         obj_pos_enc = np.insert(obj_pos_enc, 0, frame_idx).astype(np.int32)
         obj_pos_enc = obj_pos_enc[: self.max_obj_ptrs_in_encoder]
-        # print('obj_pos_enc : ', obj_pos_enc)
-        # 最近15帧的object_ptrs
-        # print("object_ptrs: ", end='')
+
         for i in range(frame_idx - 15, frame_idx):
             if i < 1:
                 continue
@@ -433,7 +748,6 @@ class SAM2TrackerTRT:
             if mem is not None:
                 # print(i, end=', ')
                 object_ptrs.append(mem["obj_ptr"].copy())
-        # print()
 
         for i, pos_enc in enumerate(reversed(memmask_pos_enc[1:])):
             pos_enc[:] = pos_enc[:] + self.maskmem_tpos_enc[i]
@@ -448,15 +762,6 @@ class SAM2TrackerTRT:
         object_ptrs = object_ptrs[0:1] + object_ptrs[1:][::-1]
         object_ptrs = np.stack(object_ptrs, axis=0)
 
-        # dynamic_shapes = {
-        #     "maskmem_feats": memory.shape,
-        #     "memory_pos_embed": memory_pos_embed.shape,
-        #     "obj_ptrs": object_ptrs.shape,
-        #     "obj_pos": obj_pos_enc.shape,
-        # }
-        # print("dynamic_shapes: ", dynamic_shapes)
-        inputs_buffer, outputs_buffer, bindings, stream = self.buffers[1]
-        # self.contexts[1].set_optimization_profile_async(profile_idx=0, stream=stream)
         self.contexts[1].set_input_shape("maskmem_feats", memory.shape)
         self.contexts[1].set_input_shape("memory_pos_embed", memory_pos_embed.shape)
         self.contexts[1].set_input_shape("obj_ptrs", object_ptrs.shape)
@@ -472,7 +777,6 @@ class SAM2TrackerTRT:
 
         return memory_attention_outputs
 
-     
     def memory_encoder_inference(
         self, vision_feats, high_res_feats, obj_score_logits, isMaskFromPts
     ):
@@ -486,7 +790,6 @@ class SAM2TrackerTRT:
             self.buffers[2],
         )
 
-     
     def mask_decoder_inference(
         self, input_points, input_labels, pixel_feat_with_memory, high_res_feats0, high_res_feats1
     ):
@@ -500,53 +803,35 @@ class SAM2TrackerTRT:
             self.buffers[3],
         )
 
-    def add_first_frame_bbox(self, frame_idx, image, first_frame_bbox):
-        """
-        Add the first bbox when the frame_idx is 0.
-        """
-        input_image = image.astype(np.float32)[np.newaxis, ...]
+    def _add_first_frame_prompts(self, image, prompt_coords, prompt_labels):
+
+        self.init_state()
+
+        input_image = cv2.resize(image, (self.image_size, self.image_size))
+        input_image = input_image.astype(np.float32)[np.newaxis, ...]
 
         image_encoder_outputs = self.image_encoder_inference(input_image)
         high_res_features0, high_res_features1, low_res_features, _, pix_feat_with_mem = (
             image_encoder_outputs
         )
-        # for o in image_encoder_outputs:
-        #     print(f'image_encoder_outputs : {o.shape}, {o.sum()}, {o.ravel()[-10:]}') #{o.min()}, {o.max()}, {o.mean()}, {o.std()}')
-        # print()
-
-        box_coords = np.array(first_frame_bbox).reshape((1, 2, 2))
-        box_labels = np.array([2, 3]).reshape((1, 2))
-
-        # video_H, video_W = frame.shape[:2]
-        points = box_coords / np.array([self.video_W, self.video_H])
-
-        input_points = (points * self.image_size).astype(np.float32)
-        input_labels = box_labels.astype(np.int32)
 
         mask_decoder_outputs = self.mask_decoder_inference(
-            input_points, input_labels, pix_feat_with_mem, high_res_features0, high_res_features1
+            prompt_coords, prompt_labels, pix_feat_with_mem, high_res_features0, high_res_features1
         )
-        low_res_multimasks, ious, obj_ptrs, object_score_logits, self.maskmem_tpos_enc = (
+        _low_res_multimasks, ious, obj_ptrs, object_score_logits, self.maskmem_tpos_enc = (
             mask_decoder_outputs
         )
-        # for o in mask_decoder_outputs:
-        #     print(f'mask_decoder_outputs : {o.shape}, {o.sum()}, {o.ravel()[-10:]}') #{o.min()}, {o.max()}, {o.mean()}, {o.std()}')
-        # print()
-        # exit(0)
 
         pred_mask, high_res_masks_for_mem, best_iou_inds, kf_score = self._forward_sam_head(
             mask_decoder_outputs
         )
 
         # memory_encoder predict
-        is_mask_from_pts = np.array([frame_idx == 0]).astype(bool)
+        is_mask_from_pts = np.array([self.frame_idx == 0]).astype(bool)
         memory_encoder_outputs = self.memory_encoder_inference(
             low_res_features, high_res_masks_for_mem, object_score_logits, is_mask_from_pts
         )
         maskmem_features, maskmem_pos_enc = memory_encoder_outputs
-        # for o in memory_encoder_outputs:
-        #     print(f'memory_encoder_outputs : {o.shape}, {o.sum()}, {o.min()}, {o.max()}, {o.mean()}, {o.std()}')
-        # print()
 
         # save to memory bank
         self.memory_bank[0] = {
@@ -558,32 +843,60 @@ class SAM2TrackerTRT:
             "kf_score": kf_score,
         }
 
-        return pred_mask.squeeze()
+        mask = pred_mask.squeeze()
+        mask = cv2.resize(mask, (self.video_W, self.video_H))
+        return mask
 
-     
-    def track_step(self, frame_idx, image):
-        # print(f"\033[93mframe_idx: {frame_idx}\033[0m")
+    def add_first_frame_points(self,  image, first_frame_points):
+        """
+        Add the first points when the frame_idx is 0.
+        """
+        point_coords = np.array(first_frame_points).reshape((1, 2, -1))
 
+        if point_coords.shape[-1] >= 2:
+            point_coords = point_coords[..., :2]
+        else:
+            point_coords = np.concatenate([point_coords, point_coords], axis=2)
+
+        point_labels = np.array([1, 1]).reshape((1, 2))
+
+        point_coords = point_coords / np.array([self.video_W, self.video_H])
+
+        point_coords = (point_coords * self.image_size).astype(np.float32)
+        point_labels = point_labels.astype(np.int32)
+        return self._add_first_frame_prompts(image, point_coords, point_labels)
+
+    def add_first_frame_bbox(self, image, first_frame_bbox):
+        """
+        Add the first bbox when the frame_idx is 0.
+        """
+        box_coords = np.array(first_frame_bbox).reshape((1, 2, 2))
+        box_labels = np.array([2, 3]).reshape((1, 2))
+
+        box_coords = box_coords / np.array([self.video_W, self.video_H])
+
+        box_coords = (box_coords * self.image_size).astype(np.float32)
+        box_labels = box_labels.astype(np.int32)
+        return self._add_first_frame_prompts(image, box_coords, box_labels)
+
+    def track_step(self, image):
         # step 1:image_encoder predict, get image feature
-        start = time.time()
-        # input_image = self._normalize_image(image)
-        # input_image = input_image[np.newaxis, ...]
-        input_image = image.astype(np.float32)[np.newaxis, ...]
+        self.frame_idx += 1
+        frame_idx = self.frame_idx
+
+        input_image = cv2.resize(image, (self.image_size, self.image_size))
+        input_image = input_image.astype(np.float32)[np.newaxis, ...]
 
         image_encoder_outputs = self.image_encoder_inference(input_image)
         high_res_features0, high_res_features1, low_res_features, vision_pos_embeds, _ = (
             image_encoder_outputs
         )
-        # for o in image_encoder_outputs:
-        #     print(f'image_encoder_outputs : {o.shape}, {o.sum()}, {o.min()}, {o.max()}, {o.mean()}, {o.std()}')
-        # print()
 
         # step 2: memory_attention predict
         memory_attention_outputs = self.memory_attention_inference(
             frame_idx, low_res_features, vision_pos_embeds
         )
         pix_feat_with_mem = memory_attention_outputs[0]
-        # print(f"pix_feat_with_mem :  {pix_feat_with_mem.shape}, {pix_feat_with_mem.sum()}, {pix_feat_with_mem.min()}, {pix_feat_with_mem.max()}, {pix_feat_with_mem.mean()}, {pix_feat_with_mem.std()}")
 
         # step 3 : mask decoder predict
         input_points = np.zeros((1, 2, 2), dtype=np.float32)
@@ -592,11 +905,6 @@ class SAM2TrackerTRT:
             input_points, input_labels, pix_feat_with_mem, high_res_features0, high_res_features1
         )
         _, ious, obj_ptrs, object_score_logits, _ = mask_decoder_outputs
-        # for o in mask_decoder_outputs:
-        #     print(f'mask_decoder_outputs : {o.shape}, {o.sum()}, {o.min()}, {o.max()}, {o.mean()}, {o.std()}')
-        # print()
-        # print('ious : ', ious)
-        # print('object_score_logits : ', object_score_logits)
 
         pred_mask, high_res_masks_for_mem, best_iou_inds, kf_score = self._forward_sam_head(
             mask_decoder_outputs
@@ -608,9 +916,6 @@ class SAM2TrackerTRT:
             low_res_features, high_res_masks_for_mem, object_score_logits, is_mask_from_pts
         )
         maskmem_features, maskmem_pos_enc = memory_encoder_outputs
-        # for o in memory_encoder_outputs:
-        #     print(f'memory_encoder_outputs : {o.shape}, {o.sum()}, {o.min()}, {o.max()}, {o.mean()}, {o.std()}')
-        # print()
 
         self.memory_bank[frame_idx] = {
             "maskmem_features": maskmem_features,
@@ -621,11 +926,12 @@ class SAM2TrackerTRT:
             "kf_score": kf_score,
         }
 
-        return pred_mask.squeeze()
+        mask = pred_mask.squeeze()
+        mask = cv2.resize(mask, (self.video_W, self.video_H))
+        return mask
 
     def _forward_sam_head(self, mask_decoder_outputs):
         low_res_multimasks, ious, _, _, _ = mask_decoder_outputs
-        # high_res_multimasks = F.interpolate(low_res_multimasks, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
         high_res_multimasks = cv2.resize(
             low_res_multimasks[0].transpose(1, 2, 0), (self.image_size, self.image_size)
         )
@@ -699,174 +1005,8 @@ class SAM2TrackerTRT:
                     self.kf.xyxy_to_xyah(high_res_multibboxes[best_iou_inds.item()]),
                 )
 
-        ## sam2 ---------------------------------------------------------------------##
-        # best_iou_inds = np.argmax(ious, axis=-1)
-        # batch_inds = np.arange(1)
-        # low_res_masks = low_res_multimasks[batch_inds, best_iou_inds][:, None]
-        # high_res_masks = high_res_multimasks[batch_inds, best_iou_inds][:, None]
-
-        best_iou_score = ious[0][best_iou_inds]
         kf_score = kf_ious[best_iou_inds] if kf_ious is not None else None
         pred_mask = low_res_masks
         high_res_masks_for_mem = high_res_masks
 
         return pred_mask, high_res_masks_for_mem, best_iou_inds, kf_score
-
-
-def load_txt(gt_path):
-    with open(gt_path, "r") as f:
-        gt = f.readlines()
-    prompts = {}
-    for fid, line in enumerate(gt):
-        x, y, w, h = map(float, line.split(","))
-        x, y, w, h = int(x), int(y), int(w), int(h)
-        prompts[fid] = ((x, y, x + w, y + h), 0)
-    return prompts
-
-
-def main(args):
-    tracker = SAM2TrackerTRT(args)
-
-    image_size = tracker.image_size
-    cap = cv2.VideoCapture(args.video_path)
-    num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    tracker.init_video(frame_width, frame_height)
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter("./trt_demo.mp4", fourcc, 30, (frame_width, frame_height))
-
-    name_window = os.path.basename(args.video_path)
-    # cv2.namedWindow(name_window, cv2.WINDOW_NORMAL)
-
-    start = time.time()
-    for frame_idx in tqdm(range(num_frames), desc="Processing video frames"):
-        # print(f"\033[93mframe_idx: {frame_idx}\033[0m")
-        # start = time.time()
-        ret, frame = cap.read()
-        if not ret:
-            raise ValueError("Failed to read frame from video.")
-
-        input_image = cv2.resize(frame, (image_size, image_size))
-        input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
-
-        if frame_idx == 0:
-            # bbox = cv2.selectROI(name_window, frame) # (x, y, w, h)
-            # x, y, w, h = bbox
-            # first_frame_bbox = [x, y, x + w, y + h]
-
-            first_frame_bbox = load_txt(args.txt_path)[0][0]
-
-            mask = tracker.add_first_frame_bbox(0, input_image, first_frame_bbox)
-        else:
-            mask = tracker.track_step(frame_idx, input_image)
-
-        mask = cv2.resize(mask, (frame_width, frame_height))
-        mask = mask > 0.0
-        non_zero_indices = np.argwhere(mask)
-        if len(non_zero_indices) == 0:
-            bbox = [0, 0, 0, 0]
-        else:
-            y_min, x_min = non_zero_indices.min(axis=0).tolist()
-            y_max, x_max = non_zero_indices.max(axis=0).tolist()
-            bbox = [x_min, y_min, x_max - x_min, y_max - y_min]
-
-        mask_img = np.zeros((frame_height, frame_width, 3), np.uint8)
-        mask_img[mask] = colors[1]
-        frame = cv2.addWeighted(frame, 1, mask_img, 0.4, 0)
-
-        cv2.rectangle(
-            frame, (bbox[0], bbox[1]), (bbox[0] + bbox[2], bbox[1] + bbox[3]), colors[1], 2
-        )
-        out.write(frame)
-
-        # if args.show:
-        #     cv2.imshow(name_window, frame)
-        #     cv2.waitKey(1)
-
-    elapsed = (time.time() - start) * 1000
-    print(f"Elapsed time: {elapsed:.3f} ms")
-    print(f"every frame spend time: {elapsed / (frame_idx + 1):.2f}ms")
-    print(f"fps: {1000 / (elapsed / (frame_idx + 1)):.2f}")
-
-    cap.release()
-    out.release()
-    # cv2.destroyAllWindows()
-
-
-def test(args):
-    tracker = SAM2TrackerTRT(args)
-
-    # # test image_encoder inference
-    # input_data = np.ones((1, 512, 512, 3)).astype(np.float32)
-    # outputs = tracker.image_encoder_inference(input_data)
-    # for i, output in enumerate(outputs):
-    #     print("Output {}: {}, {}".format(i, output.shape, output.sum()))
-
-    # test memory_attention inference
-    for i in range(20):
-        vision_feats = np.ones((1024, 1, 256)).astype(np.float32)
-        vision_pos = np.ones((1024, 1, 256)).astype(np.float32)
-        outputs = tracker.memory_attention_inference_test(0, vision_feats, vision_pos, i + 1)
-        for i, output in enumerate(outputs):
-            print(
-                "Output {}: {}, {}".format(i, output.shape, output.sum()),
-                output.min(),
-                output.max(),
-                output.mean(),
-                output.std(),
-            )
-
-    # # test memory_encoder inference
-    # vision_feats = np.ones((1024, 1, 256)).astype(np.float32)
-    # high_res_feats = np.ones((1, 1, 512, 512)).astype(np.float32)
-    # obj_score_logits = np.ones((1, 1)).astype(np.float32)
-    # isMaskFromPts = np.array(0).astype(np.bool)
-    # outputs = tracker.memory_encoder_inference(vision_feats, high_res_feats, obj_score_logits, isMaskFromPts)
-    # for i, output in enumerate(outputs):
-    #     print("Output {}: {}, {}".format(i, output.shape, output.sum()))
-
-    # # test mask_decoder inference
-    # # input_points = np.array([[[307.2000, 432.3556],
-    # #                         [580.8000, 881.7778]]], dtype=np.float32)
-    # # input_labels = np.array([2, 3], dtype=np.int32)
-    # input_points = np.ones((1, 2, 2)).astype(np.float32)
-    # input_labels = np.ones((1, 2)).astype(np.int32)
-
-    # pixel_feat_with_memory = np.ones((1, 256, 32, 32)).astype(np.float32)
-
-    # high_res_feats0 = np.ones((1, 32, 128, 128)).astype(np.float32)
-    # high_res_feats1 = np.ones((1, 64, 64, 64)).astype(np.float32)
-
-    # outputs = tracker.mask_decoder_inference(input_points, input_labels, pixel_feat_with_memory, high_res_feats0, high_res_feats1)
-    # for i, output in enumerate(outputs):
-    #     print(f"Output {i} ", output.shape, output.sum())
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--video_path",
-        default="../assets/1917.mp4",
-        help="Input video path or directory of frames.",
-    )
-    parser.add_argument(
-        "--txt_path", default="../first_frame_bbox.txt", help="Path to ground truth text file."
-    )
-    parser.add_argument(
-        "--onnx_model_path", default="../onnx_model", help="Path to the onnx model."
-    )
-    parser.add_argument("--trt_engine_path", help="Path to the tensorRT model.")
-    parser.add_argument(
-        "--video_output_path", default="demo.mp4", help="Path to save the output video."
-    )
-    parser.add_argument("--save_to_video", default=False, help="Save results to a video.")
-    parser.add_argument(
-        "--use_fp16", action="store_true", default=True, help="Use FP16 precision for inference."
-    )
-    parser.add_argument("--show", action="store_true", help="Show inference results with opencv.")
-    args = parser.parse_args()
-
-    main(args)
-    # test(args)

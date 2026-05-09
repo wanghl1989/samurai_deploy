@@ -7,9 +7,8 @@ import cv2
 import numpy as np
 import onnx
 import tensorrt as trt
-from tqdm import tqdm
-
 from kalman_filter import KalmanFilter
+from tqdm import tqdm
 
 colors = [
     (0, 0, 255),  # red 0
@@ -83,7 +82,7 @@ class BoxSelector:
         )
         cv2.imshow(self.window_name, display_img)
 
-    def mouse_callback(self, event, x, y, flags, param):
+    def mouse_callback(self, event, x, y, _flags, _param):
         """Handle mouse events for box drawing."""
         if event == cv2.EVENT_LBUTTONDOWN:
             # 左键按下：开始画框
@@ -455,7 +454,7 @@ class SAM2TrackerTRT:
 
         inputs_buffer, outputs_buffer, bindings, stream = buffers
 
-        for i, input in enumerate(inputs_buffer):
+        for i, _input in enumerate(inputs_buffer):
             # print(
             #     "Input {}: {}, {}, {}".format(
             #         i, inputs_buffer[i]["name"], input_datas[i].shape, inputs_buffer[i]["shape"]
@@ -490,18 +489,18 @@ class SAM2TrackerTRT:
         cudart.cudaStreamSynchronize(stream)
         execute_end = time.time()
 
-        # print("execute_async_v3 time: {:.3} ms".format((execute_end - execute_begin) * 1000))
+        print("execute_async_v3 time: {:.3} ms".format((execute_end - execute_begin) * 1000))
 
         retrieve_begin = time.time()
         outputs_data = [
             output["host_mem"].reshape(output["shape"]).copy() for output in outputs_buffer
         ]
         retrieve_end = time.time()
-        # print("Retrieve time: {:.3} ms".format((retrieve_end - retrieve_begin) * 1000))
+        print("Retrieve time: {:.3} ms".format((retrieve_end - retrieve_begin) * 1000))
 
         return outputs_data
 
-    @timer_decorator
+     
     def image_encoder_inference(self, input_image):
         """
         Image encoder inference.
@@ -515,8 +514,8 @@ class SAM2TrackerTRT:
             self.buffers[0],
         )
 
-    @timer_decorator
-    def memory_attention_inference_test(self, frame_idx, vision_feats, vision_pos, i):
+     
+    def memory_attention_inference_test(self, _frame_idx, vision_feats, vision_pos, i):
         """
         Memory attention inference for testing.
         """
@@ -527,7 +526,7 @@ class SAM2TrackerTRT:
         object_ptrs = np.ones((m, 1, 256)).astype(np.float32)
         obj_pos_enc = np.ones((m,)).astype(np.int32)
 
-        inputs_buffer, outputs_buffer, bindings, stream = self.buffers[1]
+        # inputs_buffer, outputs_buffer, bindings, stream = self.buffers[1]
         # self.contexts[1].set_optimization_profile_async(0, stream=stream.handle)
         self.contexts[1].set_input_shape("maskmem_feats", (1024, n, 1, 64))
         self.contexts[1].set_input_shape("memory_pos_embed", (1024, n, 1, 64))
@@ -543,7 +542,7 @@ class SAM2TrackerTRT:
         )
         return memory_attention_outputs
 
-    @timer_decorator
+     
     def memory_attention_inference(self, frame_idx, vision_feats, vision_pos):
         """
         Memory attention inference.
@@ -620,7 +619,7 @@ class SAM2TrackerTRT:
         #     "obj_pos": obj_pos_enc.shape,
         # }
         # print("dynamic_shapes: ", dynamic_shapes)
-        inputs_buffer, outputs_buffer, bindings, stream = self.buffers[1]
+        # inputs_buffer, outputs_buffer, bindings, stream = self.buffers[1]
         # self.contexts[1].set_optimization_profile_async(profile_idx=0, stream=stream)
         self.contexts[1].set_input_shape("maskmem_feats", memory.shape)
         self.contexts[1].set_input_shape("memory_pos_embed", memory_pos_embed.shape)
@@ -637,7 +636,7 @@ class SAM2TrackerTRT:
 
         return memory_attention_outputs
 
-    @timer_decorator
+     
     def memory_encoder_inference(
         self, vision_feats, high_res_feats, obj_score_logits, isMaskFromPts
     ):
@@ -651,7 +650,7 @@ class SAM2TrackerTRT:
             self.buffers[2],
         )
 
-    @timer_decorator
+     
     def mask_decoder_inference(
         self, input_points, input_labels, pixel_feat_with_memory, high_res_feats0, high_res_feats1
     ):
@@ -681,8 +680,15 @@ class SAM2TrackerTRT:
 
         box_coords = np.array(first_frame_bbox).reshape((1, 2, 2))
         box_labels = np.array([2, 3]).reshape((1, 2))
-        # box_coords = np.array([[300, 400], [400, 400]]).reshape(-1, 2, 2)
-        # box_labels = np.array([[2, 3]]).reshape(1, 2)
+
+        # point inference
+        box_coords = np.array(first_frame_bbox).reshape((1, 2, 2))
+        box_coords[..., 2] = box_coords[..., 1]
+        box_labels = np.array(
+            [
+                1,
+            ]
+        ).reshape((1, 1))
 
         # video_H, video_W = frame.shape[:2]
         points = box_coords / np.array([self.video_W, self.video_H])
@@ -693,7 +699,7 @@ class SAM2TrackerTRT:
         mask_decoder_outputs = self.mask_decoder_inference(
             input_points, input_labels, pix_feat_with_mem, high_res_features0, high_res_features1
         )
-        low_res_multimasks, ious, obj_ptrs, object_score_logits, self.maskmem_tpos_enc = (
+        _low_res_multimasks, ious, obj_ptrs, object_score_logits, self.maskmem_tpos_enc = (
             mask_decoder_outputs
         )
         # for o in mask_decoder_outputs:
@@ -727,12 +733,12 @@ class SAM2TrackerTRT:
 
         return pred_mask.squeeze()
 
-    @timer_decorator
+     
     def track_step(self, frame_idx, image):
         # print(f"\033[93mframe_idx: {frame_idx}\033[0m")
 
         # step 1:image_encoder predict, get image feature
-        start = time.time()
+        _start = time.time()
         # input_image = self._normalize_image(image)
         # input_image = input_image[np.newaxis, ...]
         input_image = image.astype(np.float32)[np.newaxis, ...]
@@ -872,7 +878,7 @@ class SAM2TrackerTRT:
         # low_res_masks = low_res_multimasks[batch_inds, best_iou_inds][:, None]
         # high_res_masks = high_res_multimasks[batch_inds, best_iou_inds][:, None]
 
-        best_iou_score = ious[0][best_iou_inds]
+        # _best_iou_score = ious[0][best_iou_inds]
         kf_score = kf_ious[best_iou_inds] if kf_ious is not None else None
         pred_mask = low_res_masks
         high_res_masks_for_mem = high_res_masks
@@ -901,7 +907,6 @@ def main(args):
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     tracker.init_video(frame_width, frame_height)
 
-
     # fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     # out = cv2.VideoWriter('./trt_demo.mp4', fourcc, 30, (frame_width, frame_height))
 
@@ -928,7 +933,6 @@ def main(args):
             # first_frame_bbox = load_txt(args.txt_path)[0][0]
             bbox_selector = BoxSelector(name_window, frame)
             first_frame_bbox = bbox_selector.wait_for_selection()
-            print(first_frame_bbox)
             if first_frame_bbox is None:
                 break
 

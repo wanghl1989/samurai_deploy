@@ -404,7 +404,7 @@ def export_sam2_image_encoder(image_encoder: ImageEncoder, config):
             "vision_pos_embeds",
             "pix_feat_with_mem",
         ],
-        opset_version=17,
+        opset_version=15,
         # dynamic_axes={
         #     "image": {0 : "height", 1: "width"},
         # }
@@ -513,7 +513,7 @@ def export_sam2_memory_attention(memory_attention: MemoryAttention, config):
             "obj_pos",
         ],
         output_names=["pix_feat_with_mem"],
-        opset_version=17,
+        opset_version=15,
         dynamic_axes={
             # "current_vision_feats": {0: "num_feat"},
             # "current_vision_pos_embeds": {0: "num_pos_enc"},
@@ -604,7 +604,7 @@ def export_sam2_memory_encoder(memory_encoder: MemoryEncoder, config):
         verbose=False,
         input_names=["pix_feat", "mask_for_mem", "object_score_logits", "is_mask_from_pts"],
         output_names=["maskmem_features", "maskmem_pos_enc"],
-        opset_version=17,
+        opset_version=15,
         # dynamic_axes = {
         #                 "pix_feat": {0: "num_feat"},
         #                 "mask_for_mem": {2: "height", 3: "width"},
@@ -737,7 +737,7 @@ def export_sam2_mask_decoder(mask_decoder: MaskDecoder, config):
             "object_score_logits",
             "maskmem_tpos_enc",
         ],
-        opset_version=17,
+        opset_version=15,
         # dynamic_axes={
         # "point_coords": {1: "num_points"},
         # "point_labels": {1: "num_points"},
@@ -816,7 +816,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model_path",
-        default="./sam2/checkpoints/sam2.1_hiera_tiny.pt",
+        default="./sam2/checkpoints/sam2.1_hiera_small.pt",
         help="Path to the model checkpoint.",
     )
     parser.add_argument("--use_fp16", default=False, help="export fp16 onnx model.")
